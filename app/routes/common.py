@@ -30,8 +30,8 @@ import json
 router = APIRouter(prefix="/api/v1/common", tags=["Common"])
 
 # MongoDB setup
-mongo_client = MongoClient("mongodb://localhost:27017")
-db = mongo_client["manger_db"]
+mongo_client = get_mongo_client()
+db = mongo_client[settings.MONGO_DB_NAME]
 files_collection = db["uploaded_files"]
 
 BASE_UPLOAD_DIR = "uploads"
