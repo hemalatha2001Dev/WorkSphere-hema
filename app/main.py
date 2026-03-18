@@ -13,7 +13,10 @@ app = FastAPI(
 )
 
 # Create tables if not exists
-Base.metadata.create_all(bind=engine)
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as e:
+    print(f"Warning: Database connection failed during startup: {e}")
 
 # Middleware for CORS
 app.add_middleware(
