@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pydantic
+sqlalchemy
+mysql-connector-python
+pymongo
+passlib[bcrypt]
+python-jose
+msal
+requests
+python-dotenv
+alembic
+
+google-cloud-storage
