@@ -1,65 +1,46 @@
 # app/utils/outlook_mail.py
-import requests
+# Replaced Microsoft MSAL / Entra ID with Gmail SMTP (App Password)
+import smtplib
+import ssl
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from app.core.config import settings
-
-# Auth setup - constants are computed lazily inside functions
-# DO NOT initialize ConfidentialClientApplication at module level.
-# When TENANT_ID is empty (e.g. missing env var on Cloud Run), it crashes the entire server.
-
-SCOPES = ["https://graph.microsoft.com/.default"]
-GRAPH_API_ENDPOINT = "https://graph.microsoft.com/v1.0"
-
-
-def _get_msal_app():
-    """Lazily create the MSAL client only when an email needs to be sent."""
-    from msal import ConfidentialClientApplication
-    if not settings.TENANT_ID or not settings.CLIENT_ID or not settings.CLIENT_SECRET:
-        raise Exception("Email credentials (TENANT_ID, CLIENT_ID, CLIENT_SECRET) are not configured.")
-    authority = f"https://login.microsoftonline.com/{settings.TENANT_ID}"
-    return ConfidentialClientApplication(
-        settings.CLIENT_ID,
-        authority=authority,
-        client_credential=settings.CLIENT_SECRET,
-    )
-
-
-def get_access_token():
-    msal_app = _get_msal_app()
-    token = msal_app.acquire_token_for_client(scopes=SCOPES)
-    if "access_token" in token:
-        return token["access_token"]
-    raise Exception(f"Could not acquire token: {token}")
 
 
 def send_otp_email(recipient_email: str, otp: str):
-    try:
-        access_token = get_access_token()
-    except Exception as e:
-        print(f"[Email] Skipping OTP email - credentials not configured: {e}")
+    """Send OTP email via Gmail SMTP using App Password."""
+    if not settings.SENDER_EMAIL or not settings.GMAIL_APP_PASSWORD:
+        print("[Email] Gmail credentials not configured. Skipping OTP email.")
         return
 
-    message = {
-        "message": {
-            "subject": "Your OTP Code",
-            "body": {
-                "contentType": "Text",
-                "content": f"Your OTP is {otp}. It will expire in 10 minutes."
-            },
-            "toRecipients": [
-                {"emailAddress": {"address": recipient_email}}
-            ]
-        },
-        "saveToSentItems": "true"
-    }
+    subject = "Your OTP Code - WorkSphere"
+    body = f"""
+Hello,
 
-    response = requests.post(
-        f"{GRAPH_API_ENDPOINT}/users/{settings.SENDER_EMAIL}/sendMail",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        },
-        json=message
-    )
+Your OTP code for WorkSphere is:
 
-    if response.status_code != 202:
-        raise Exception(f"Failed to send email: {response.status_code} {response.text}")
+    {otp}
+
+This OTP is valid for 10 minutes. Do not share it with anyone.
+
+If you did not request this, please ignore this email.
+
+Regards,
+WorkSphere Team
+    """
+
+    msg = MIMEMultipart()
+    msg["From"] = settings.SENDER_EMAIL
+    msg["To"] = recipient_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+            server.login(settings.SENDER_EMAIL, settings.GMAIL_APP_PASSWORD)
+            server.sendmail(settings.SENDER_EMAIL, recipient_email, msg.as_string())
+        print(f"[Email] OTP sent successfully to {recipient_email}")
+    except Exception as e:
+        print(f"[Email] Failed to send OTP email: {e}")
+        raise Exception(f"Failed to send OTP email: {e}")

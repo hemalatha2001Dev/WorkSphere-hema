@@ -10,13 +10,14 @@ class Settings(BaseSettings):
     # Database connections
     MYSQL_URL: str = "mysql+pymysql://root:snr%401234@localhost/manager_db"
     MONGO_DB_URL: str = "mongodb://localhost:27017"
-    MONGO_DB_NAME: str = "manger_db"  # Keeping your original typo
+    MONGO_DB_NAME: str = "manger_db"
 
-    # Outlook / Email credentials
-    CLIENT_ID: str = ""
-    CLIENT_SECRET: str = ""
-    TENANT_ID: str = ""
+    # Gmail SMTP credentials (replaces Microsoft Entra ID / MSAL)
     SENDER_EMAIL: str = ""
+    GMAIL_APP_PASSWORD: str = ""
+
+    # GCS Bucket
+    GCS_BUCKET_NAME: str = "workspehere-bukcet"
 
     class Config:
         env_file = ".env"
