@@ -17,7 +17,7 @@ from app.utils.send_email import send_user_credentials_email
 from app.core.config import settings
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr, ValidationError, field_validator,validator
+from pydantic import BaseModel, EmailStr, ValidationError, field_validator
 from typing import Optional, Union, List, Literal, Dict, Any
 import pandas as pd
 import io
@@ -1251,7 +1251,8 @@ class EmployeeImportItem(BaseModel):
 class BulkImportRequest(BaseModel):
     employees: List[EmployeeImportItem]
 
-    @validator('employees')
+    @field_validator('employees')
+    @classmethod
     def validate_employee_count(cls, v):
         if len(v) > 1000:
             raise ValueError('Maximum 1000 employees can be imported at once')
