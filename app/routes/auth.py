@@ -239,7 +239,12 @@ async def login(
                 identifier = username
                 pwd = password
         
-        # Final validation
+        # Final validation and cleanup
+        if identifier:
+            identifier = str(identifier).strip()
+        if pwd:
+            pwd = str(pwd).strip()
+
         if not identifier or not pwd:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -270,9 +275,11 @@ async def login(
         # Verify password
         stored_password = user_dict.get("password")
         if not stored_password or not verify_password(pwd, stored_password):
+            # Log the attempt for security
+            print(f"Login failed for user: {identifier}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials"
+                detail="Invalid username or password"
             )
 
         # Create JWT token
