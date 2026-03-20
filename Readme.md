@@ -153,3 +153,11 @@ def get_project_chats(
 then,after verifying socket satus is offline then send the msg to respective user's email id this needs to be an immediate action so api need is
 5.create one api connected to check whether connected socket status is online or offline so,based on this modify the post and get api's 
 6.use this existing email service for this 
+
+
+
+MYSQL_URL mysql+pymysql://root:worksphere@@2026@127.0.0.1:3306/snr_app_db
+MONGO_DB_URL mongodb+srv://devtestkarthik_db_user:JY8ocxjnAl3OTrtz@cluster0.5hkjala.mongodb.net/?appName=Cluster0
+MONGO_DB_NAME manger_db
+GCS_BUCKET_NAME workspehere-bukcet
+SECRET_KEY supersecretkey

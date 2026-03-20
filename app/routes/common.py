@@ -84,9 +84,7 @@ async def upload_file(
 
     result = files_collection.insert_one(file_data)
 
-    # Get full host URL
-    base_url = str(request.base_url).rstrip("/")
-    file_url = f"{base_url}/uploads/{category}/{filename}"
+    # Use the file_url from GCS upload
 
     return {
         "file_mongo_id": str(result.inserted_id),

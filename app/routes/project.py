@@ -97,32 +97,48 @@ def calculate_project_progress(add_project_phase: Optional[List[dict]]) -> float
 # --- Connection Manager ---
 class ConnectionManager:
     def __init__(self):
-        # Each project_id maps to a list of active WebSocket connections
+        # project_id -> list of websockets
         self.active_connections: Dict[int, List[WebSocket]] = {}
+        # user_id -> set of project_ids they are active in
+        self.user_status: Dict[str, set] = {}
 
-    async def connect(self, websocket: WebSocket, project_id: int):
+    async def connect(self, websocket: WebSocket, project_id: int, user_id: str):
         await websocket.accept()
         if project_id not in self.active_connections:
             self.active_connections[project_id] = []
         self.active_connections[project_id].append(websocket)
-        print(f"✅ Client connected for Project {project_id} | Total: {len(self.active_connections[project_id])}")
+        
+        if user_id not in self.user_status:
+            self.user_status[user_id] = set()
+        self.user_status[user_id].add(project_id)
+        
+        print(f"✅ Client {user_id} connected for Project {project_id}")
 
-    def disconnect(self, websocket: WebSocket, project_id: int):
+    def disconnect(self, websocket: WebSocket, project_id: int, user_id: str):
         if project_id in self.active_connections:
             if websocket in self.active_connections[project_id]:
                 self.active_connections[project_id].remove(websocket)
             if not self.active_connections[project_id]:
                 del self.active_connections[project_id]
-        print(f"❌ Client disconnected from Project {project_id}")
+        
+        if user_id in self.user_status:
+            if project_id in self.user_status[user_id]:
+                self.user_status[user_id].remove(project_id)
+            if not self.user_status[user_id]:
+                del self.user_status[user_id]
+        
+        print(f"❌ Client {user_id} disconnected from Project {project_id}")
+
+    def is_online(self, user_id: str) -> bool:
+        return user_id in self.user_status
 
     async def broadcast(self, message: dict, project_id: int):
-        """Send message to all sockets connected for that project"""
         if project_id in self.active_connections:
             for connection in list(self.active_connections[project_id]):
                 try:
                     await connection.send_json(message)
                 except Exception as e:
-                    print(f"⚠️ Broadcast failed for Project {project_id}: {e}")
+                    print(f"⚠️ Broadcast failed: {e}")
 
 manager = ConnectionManager()
 
@@ -969,137 +985,89 @@ def get_upcoming_deadlines_alerts(
         raise HTTPException(status_code=500, detail=f"Error fetching alerts: {str(e)}")
 
 
-# # Keep POST as is - for adding messages
-# @router.post("/chat", response_model=ChatResponseSchema)
-# def add_chat_message(
-#     chat: ChatMessageSchema,
-#     db: Session = Depends(get_mysql_session),
-#     current_user: dict = Depends(get_current_user),
-# ):
-#     """Add chat message to project"""
-#     try:
-#         chat_doc = {
-#             "project_id": chat.project_id,
-#             "sender_name": chat.sender_name,
-#             "sender_id": chat.sender_id,
-#             "message": chat.message,
-#             "timestamp": datetime.utcnow(),
-#         }
+# Keep POST as is - for adding messages
+@router.post("/chat", response_model=ChatResponseSchema)
+async def add_chat_message(
+    chat: ChatMessageSchema,
+    db: Session = Depends(get_mysql_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Add chat message to project and broadcast via socket"""
+    try:
+        chat_doc = {
+            "project_id": chat.project_id,
+            "sender_name": chat.sender_name,
+            "sender_id": chat.sender_id,
+            "message": chat.message,
+            "timestamp": datetime.utcnow(),
+        }
 
-#         mongo_client = get_mongo_client()
-#         if mongo_client:
-#             mongo_db = mongo_client[settings.MONGO_DB_NAME]
-#             mongo_db["project_chats"].insert_one(chat_doc)
+        # MongoDB insert
+        mongo_client = get_mongo_client()
+        if mongo_client:
+            mongo_db = mongo_client[settings.MONGO_DB_NAME]
+            result = mongo_db["project_chats"].insert_one(chat_doc)
+            chat_doc["_id"] = str(result.inserted_id)
 
-#         existing_project = (
-#             db.query(Project).filter(Project.id == chat.project_id).first()
-#         )
-#         if existing_project:
-#             # Create chat data for MySQL - exclude timestamp and any MongoDB _id
-#             mysql_chat_data = {
-#                 "project_id": chat_doc["project_id"],
-#                 "sender_name": chat_doc["sender_name"],
-#                 "sender_id": chat_doc["sender_id"],
-#                 "message": chat_doc["message"],
-#             }
-#             new_chat = ProjectChat(**mysql_chat_data)
-#             db.add(new_chat)
-#             db.commit()
-#             db.refresh(new_chat)
-#             return ChatResponseSchema(
-#                 id=new_chat.id,
-#                 project_id=new_chat.project_id,
-#                 sender_name=new_chat.sender_name,
-#                 sender_id=new_chat.sender_id,
-#                 message=new_chat.message,
-#                 timestamp=new_chat.timestamp,
-#             )
+        # Broadcast via socket
+        chat_doc_socket = chat_doc.copy()
+        if isinstance(chat_doc_socket.get("timestamp"), datetime):
+            chat_doc_socket["timestamp"] = chat_doc_socket["timestamp"].isoformat()
+        await manager.broadcast(chat_doc_socket, chat.project_id)
 
-#         return ChatResponseSchema(
-#             id=0,
-#             project_id=chat_doc["project_id"],
-#             sender_name=chat_doc["sender_name"],
-#             sender_id=chat_doc["sender_id"],
-#             message=chat_doc["message"],
-#             timestamp=chat_doc["timestamp"],
-#         )
+        existing_project = (
+            db.query(Project).filter(Project.id == chat.project_id).first()
+        )
+        if existing_project:
+            # Create chat data for MySQL
+            mysql_chat_data = {
+                "project_id": chat_doc["project_id"],
+                "sender_name": chat_doc["sender_name"],
+                "sender_id": chat_doc["sender_id"],
+                "message": chat_doc["message"],
+            }
+            new_chat = ProjectChat(**mysql_chat_data)
+            db.add(new_chat)
+            db.commit()
+            db.refresh(new_chat)
+            
+            return ChatResponseSchema(
+                id=str(new_chat.id),
+                project_id=new_chat.project_id,
+                sender_name=new_chat.sender_name,
+                sender_id=new_chat.sender_id,
+                message=new_chat.message,
+                timestamp=new_chat.timestamp,
+            )
 
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         db.rollback()
-#         raise HTTPException(
-#             status_code=500, detail=f"Error adding chat message: {str(e)}"
-#         )
+        return ChatResponseSchema(
+            id=chat_doc.get("_id", "0"),
+            project_id=chat_doc["project_id"],
+            sender_name=chat_doc["sender_name"],
+            sender_id=chat_doc["sender_id"],
+            message=chat_doc["message"],
+            timestamp=chat_doc["timestamp"],
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Error adding chat message: {str(e)}"
+        )
 
 
-# # Change GET to use a different path to avoid conflicts
-# @router.get("/chat/messages", response_model=List[ChatResponseSchema])
-# def get_project_chats(
-#     project_id: int = Query(..., description="Project ID to get chat messages for"),
-#     db: Session = Depends(get_mysql_session),
-#     current_user: dict = Depends(get_current_user),
-# ):
-#     """
-#     Get all chat messages for a project.
-#     Example: GET /api/v1/projects/chat/messages?project_id=18
-#     """
-#     chats_list = []
-
-#     try:
-#         # Try MongoDB first
-#         mongo_client = get_mongo_client()
-#         if mongo_client:
-#             mongo_db = mongo_client[settings.MONGO_DB_NAME]
-#             docs = list(
-#                 mongo_db["project_chats"]
-#                 .find({"project_id": project_id})
-#                 .sort("timestamp", 1)
-#             )
-#             for d in docs:
-#                 chats_list.append(
-#                     ChatResponseSchema(
-#                         id=str(d.get("_id")),  # Keep as string for MongoDB ObjectId
-#                         project_id=d["project_id"],
-#                         sender_name=d.get("sender_name", "Unknown"),
-#                         sender_id=d.get("sender_id", "0"),
-#                         message=d.get("message", ""),
-#                         timestamp=d.get("timestamp", datetime.utcnow()),
-#                     )
-#                 )
-
-#         # Fallback to MySQL if MongoDB has no data
-#         if not chats_list:
-#             chats = (
-#                 db.query(ProjectChat)
-#                 .filter(ProjectChat.project_id == project_id)
-#                 .order_by(ProjectChat.timestamp.asc())
-#                 .all()
-#             )
-#             for c in chats:
-#                 chats_list.append(
-#                     ChatResponseSchema(
-#                         id=c.id,  # Integer from MySQL
-#                         project_id=c.project_id,
-#                         sender_name=c.sender_name,
-#                         sender_id=c.sender_id,
-#                         message=c.message,
-#                         timestamp=c.timestamp,
-#                     )
-#                 )
-
-#         return chats_list
-
-#     except Exception as e:
-#         raise HTTPException(
-#             status_code=500, detail=f"Error fetching chat messages: {str(e)}"
-#         )
-
+@router.get("/chat/status/{user_id}")
+def get_user_chat_status(user_id: str):
+    """Check if a user is currently connected to any project chat socket"""
+    is_online = manager.is_online(user_id)
+    return {"user_id": user_id, "status": "online" if is_online else "offline"}
 
 
 @router.websocket("/chat/ws/{project_id}")
-async def project_chat_socket(websocket: WebSocket, project_id: int):
-    await manager.connect(websocket, project_id)
+async def project_chat_socket(websocket: WebSocket, project_id: int, user_id: str = Query(...)):
+    await manager.connect(websocket, project_id, user_id)
 
     try:
         while True:
@@ -1122,19 +1090,19 @@ async def project_chat_socket(websocket: WebSocket, project_id: int):
                 "timestamp": datetime.utcnow().isoformat(),
             }
 
-            # ✅ MongoDB insert
+            # MongoDB insert
             mongo_client = get_mongo_client()
             if mongo_client:
                 try:
                     mongo_db = mongo_client[settings.MONGO_DB_NAME]
                     result = mongo_db["project_chats"].insert_one(chat_doc)
-                    chat_doc["_id"] = str(result.inserted_id)  # convert ObjectId to string
+                    chat_doc["_id"] = str(result.inserted_id)
                 except Exception as me:
                     print(f"⚠️ Mongo insert error: {me}")
 
-            # ✅ MySQL insert
+            # MySQL insert
             try:
-                db = next(get_mysql_session())
+                db_session = next(get_mysql_session())
                 sql_data = {
                     "project_id": msg_project_id,
                     "sender_name": sender_name,
@@ -1142,21 +1110,24 @@ async def project_chat_socket(websocket: WebSocket, project_id: int):
                     "message": message,
                 }
                 new_chat = ProjectChat(**sql_data)
-                db.add(new_chat)
-                db.commit()
-                db.close()
+                db_session.add(new_chat)
+                db_session.commit()
+                db_session.close()
             except Exception as e:
                 print(f"⚠️ MySQL insert error: {e}")
 
-            # ✅ Broadcast message to all clients
+            # Broadcast message to all clients
             await manager.broadcast(chat_doc, msg_project_id)
 
     except WebSocketDisconnect:
-        manager.disconnect(websocket, project_id)
+        manager.disconnect(websocket, project_id, user_id)
     except Exception as e:
         print(f"🔥 WebSocket error for Project {project_id}: {e}")
-        manager.disconnect(websocket, project_id)
-        await websocket.close()
+        manager.disconnect(websocket, project_id, user_id)
+        try:
+            await websocket.close()
+        except:
+            pass
 
 
 @router.get("/chat/messages", response_model=List[ChatResponseSchema])

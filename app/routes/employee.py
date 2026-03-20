@@ -183,7 +183,8 @@ def employee_register(
         {
             "username": employee.username,
             "role": employee.role,
-            "department": employee.department
+            "department": employee.department,
+            "employee_id": employee_id
         },
         expires_delta=timedelta(days=1)
     )

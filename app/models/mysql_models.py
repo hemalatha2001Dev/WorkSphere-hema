@@ -139,8 +139,8 @@ class Task(Base):
     project_lists = Column(JSON, nullable=True)  # Project IDs as integers
     project_phases = Column(JSON, nullable=True)
     status = Column(String(50), default="Pending")
-    updated_status = Column(String, nullable=True)  # ADD THIS LINE
-    original_status = Column(String, nullable=True)  # ADD THIS LINE - Stores status before employee submission
+    updated_status = Column(String(50), nullable=True)  # ADD THIS LINE
+    original_status = Column(String(50), nullable=True)  # ADD THIS LINE - Stores status before employee submission
     priority = Column(String(50), default="Medium")
     assignee = Column(String(100), nullable=True)
     selected_team_members = Column(JSON, nullable=True)  # Employee IDs
