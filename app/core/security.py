@@ -31,10 +31,12 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         return False
     try:
         # Bcrypt legacy limit is 72 chars. Truncate to avoid 500 errors on Cloud Run.
-        safe_password = str(plain_password)[:72]
-        return pwd_context.verify(safe_password, hashed_password)
+        # Also ensure we are comparing strings, not bytes.
+        safe_password = str(plain_password).strip()[:72]
+        safe_hash = str(hashed_password).strip()
+        return pwd_context.verify(safe_password, safe_hash)
     except Exception as e:
-        print(f"Password verification error: {e}")
+        print(f"Password verification error for hash {hashed_password[:10]}: {e}")
         # If verification fails due to format mismatch, return False instead of crashing
         return False
 
