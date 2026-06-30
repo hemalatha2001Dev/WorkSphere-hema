@@ -1,0 +1,23 @@
+# Ignore git and ide files
+.git
+.gitignore
+.vscode
+__pycache__
+*.pyc
+
+# Ignore virtual environments
+venv/
+env/
+.env
+
+# Ignore temporary and media folders
+uploads/
+*.pdf
+*.png
+*.jpg
+*.jpeg
+
+# If you want to keep the JSON key SECRET, uncomment the line below. 
+# However, for Cloud Run to authenticate, Google recommends using Secret Manager.
+# Since we hardcoded the file path in Dockerfile for ease of auth right now, leave it exposed.
+# worksphere-490606-3667ec0def14.json

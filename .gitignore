@@ -1,0 +1,121 @@
+# ==============================================
+#  Python / FastAPI Backend Gitignore
+# ==============================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# ==============================================
+#  Virtual environment and Python tooling
+# ==============================================
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+
+# ==============================================
+#  IDE and Editor settings
+# ==============================================
+# VSCode and other IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ==============================================
+#  OS generated files
+# ==============================================
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ==============================================
+#  Dependency / package managers
+# ==============================================
+# PIP cache
+__pypackages__/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ==============================================
+#  Logs and databases
+# ==============================================
+*.log
+*.sqlite3
+*.db
+*.sql
+*.bak
+
+# ==============================================
+#  Environment variables and secrets
+# ==============================================
+.env
+*.env.local
+.env.*.local
+secrets.json
+
+# ==============================================
+#  Uploads / user-generated content
+# ==============================================
+uploads/
+!uploads/.gitkeep  # keep folder structure if needed
+
+# ==============================================
+#  Build artifacts / distributions
+# ==============================================
+build/
+dist/
+develop-eggs/
+.installed.cfg
+*.manifest
+*.spec
+
+# ==============================================
+#  Python testing / coverage
+# ==============================================
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+pytest_cache/
+
+# ==============================================
+#  Project-specific ignores
+# ==============================================
+# Ignore markdown notes and personal docs
+manage employee.md
+
+# Ignore temporary Python scripts under uploads
+uploads/**/*.py
+uploads/**/*.txt
+uploads/**/*.sh1
+uploads/**/*.webm
+uploads/**/*.pdf
+uploads/**/*.jpg
+uploads/**/*.jpeg
+uploads/**/*.png
+
+# Ignore hidden folders/files that might appear
+.*.swp
+*~
+
+# ==============================================
+#  Optional: keep only code and config
+# ==============================================
+!requirements.txt
+!Readme.md
+!app/
+app/worksphere-490606-3667ec0def14.json
