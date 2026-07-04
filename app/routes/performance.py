@@ -3,6 +3,8 @@ from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from typing import List, Optional
 from pydantic import BaseModel
+import logging
+import time
 
 from app.db.performance_db import get_performance_db
 from app.db.mysql import get_mysql_session
@@ -11,6 +13,8 @@ from app.core.config import settings
 from app.models.performance_models import PerformanceReview, Objective, KPIRecord
 from app.models.mysql_models import Task, User
 from app.core.security import get_current_user
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/performance", tags=["Performance"])
 
@@ -211,6 +215,9 @@ def create_review(
     if current_user["role"] not in ["Admin", "SuperAdmin"]:
         raise HTTPException(status_code=403, detail="Only Admins or SuperAdmins can create performance reviews.")
 
+    mongo_client = get_mongo_client()
+    mongo_db = mongo_client[settings.MONGO_DB_NAME] if mongo_client else None
+
     # Calculate metrics
     metrics = compute_performance_metrics(
         employee_id=review_data.employee_id,
@@ -220,23 +227,52 @@ def create_review(
         db_mysql=db_mysql
     )
 
-    new_review = PerformanceReview(
-        employee_id=review_data.employee_id,
-        reviewer_id=current_user.get("employee_id") or current_user.get("username") or "Admin",
-        review_period=review_data.review_period,
-        task_completion_rate=metrics["task_completion_rate"],
-        okr_completion_rate=metrics["okr_completion_rate"],
-        timesheet_hours=metrics["timesheet_hours"],
-        calculated_score=metrics["calculated_score"],
-        allocated_rating=review_data.allocated_rating or metrics["recommended_rating"],
-        manager_feedback=review_data.manager_feedback,
-        status=review_data.status or "Draft",
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow()
-    )
-    db_sqlite.add(new_review)
-    db_sqlite.commit()
-    db_sqlite.refresh(new_review)
+    review_doc = {
+        "employee_id": review_data.employee_id,
+        "reviewer_id": current_user.get("employee_id") or current_user.get("username") or "Admin",
+        "review_period": review_data.review_period,
+        "task_completion_rate": metrics["task_completion_rate"],
+        "okr_completion_rate": metrics["okr_completion_rate"],
+        "timesheet_hours": metrics["timesheet_hours"],
+        "calculated_score": metrics["calculated_score"],
+        "allocated_rating": review_data.allocated_rating or metrics["recommended_rating"],
+        "manager_feedback": review_data.manager_feedback,
+        "status": review_data.status or "Draft",
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
+
+    # Write to MySQL
+    mysql_success = False
+    new_review = None
+    mysql_id = None
+    try:
+        new_review = PerformanceReview(**review_doc)
+        db_sqlite.add(new_review)
+        db_sqlite.commit()
+        db_sqlite.refresh(new_review)
+        mysql_success = True
+        mysql_id = new_review.id
+    except Exception as e:
+        logger.error(f"MySQL create_review failed: {e}")
+        db_sqlite.rollback()
+
+    # Write to MongoDB
+    mongo_success = False
+    if mongo_db is not None:
+        try:
+            review_doc["id"] = mysql_id if mysql_success else -int(time.time())
+            review_doc["is_synced"] = mysql_success
+            mongo_db["performance_reviews"].insert_one(review_doc)
+            mongo_success = True
+            if not mysql_success:
+                new_review = PerformanceReview(**{k: v for k, v in review_doc.items() if k not in ["_id", "is_synced"]})
+        except Exception as e:
+            logger.error(f"MongoDB create_review failed: {e}")
+
+    if not mysql_success and not mongo_success:
+        raise HTTPException(status_code=500, detail="Database failure. Could not save performance review.")
+
     return new_review
 
 
@@ -249,20 +285,41 @@ def list_reviews(
     current_user: dict = Depends(get_current_user)
 ):
     """List performance reviews. Employees only see their own"""
-    query = db.query(PerformanceReview)
-    
-    if current_user["role"] == "Employee":
-        query = query.filter(PerformanceReview.employee_id == current_user.get("employee_id"))
-    else:
-        if employee_id:
-            query = query.filter(PerformanceReview.employee_id == employee_id)
-            
-    if review_period:
-        query = query.filter(PerformanceReview.review_period == review_period)
-    if status:
-        query = query.filter(PerformanceReview.status == status)
-        
-    return query.all()
+    mongo_client = get_mongo_client()
+    mongo_db = mongo_client[settings.MONGO_DB_NAME] if mongo_client else None
+
+    # Try MongoDB first
+    if mongo_db is not None:
+        try:
+            q = {}
+            if current_user["role"] == "Employee":
+                q["employee_id"] = current_user.get("employee_id")
+            else:
+                if employee_id: q["employee_id"] = employee_id
+            if review_period: q["review_period"] = review_period
+            if status: q["status"] = status
+            results = list(mongo_db["performance_reviews"].find(q))
+            for r in results: r.pop("_id", None)
+            return results
+        except Exception as e:
+            logger.warning(f"MongoDB list_reviews failed: {e}. Falling back to MySQL.")
+
+    # Fallback to MySQL
+    try:
+        query = db.query(PerformanceReview)
+        if current_user["role"] == "Employee":
+            query = query.filter(PerformanceReview.employee_id == current_user.get("employee_id"))
+        else:
+            if employee_id:
+                query = query.filter(PerformanceReview.employee_id == employee_id)
+        if review_period:
+            query = query.filter(PerformanceReview.review_period == review_period)
+        if status:
+            query = query.filter(PerformanceReview.status == status)
+        return query.all()
+    except Exception as e:
+        logger.error(f"MySQL list_reviews failed: {e}")
+        raise HTTPException(status_code=500, detail="Database failure. Could not fetch reviews.")
 
 
 @router.get("/reviews/{id}", response_model=ReviewResponseSchema)
@@ -445,26 +502,59 @@ def create_kpi(
     """Create a KPI record for an employee."""
     if current_user["role"] == "Employee" and current_user.get("employee_id") != payload.employee_id:
         raise HTTPException(status_code=403, detail="Employees can only create KPIs for themselves.")
+
+    mongo_client = get_mongo_client()
+    mongo_db = mongo_client[settings.MONGO_DB_NAME] if mongo_client else None
+
     denom = payload.target_value if payload.target_value != 0 else 1.0
     achievement_rate = round(min(max((payload.actual_value / denom) * 100.0, 0.0), 100.0), 2)
-    kpi = KPIRecord(
-        employee_id=payload.employee_id,
-        kpi_name=payload.kpi_name,
-        description=payload.description,
-        target_value=payload.target_value,
-        actual_value=payload.actual_value,
-        unit=payload.unit,
-        weight=payload.weight if payload.weight is not None else 1.0,
-        achievement_rate=achievement_rate,
-        review_period=payload.review_period,
-        category=payload.category,
-        created_by=current_user.get("employee_id") or current_user.get("username"),
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow()
-    )
-    db.add(kpi)
-    db.commit()
-    db.refresh(kpi)
+    kpi_doc = {
+        "employee_id": payload.employee_id,
+        "kpi_name": payload.kpi_name,
+        "description": payload.description,
+        "target_value": payload.target_value,
+        "actual_value": payload.actual_value,
+        "unit": payload.unit,
+        "weight": payload.weight if payload.weight is not None else 1.0,
+        "achievement_rate": achievement_rate,
+        "review_period": payload.review_period,
+        "category": payload.category,
+        "created_by": current_user.get("employee_id") or current_user.get("username"),
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
+
+    # Write to MySQL
+    mysql_success = False
+    kpi = None
+    mysql_id = None
+    try:
+        kpi = KPIRecord(**kpi_doc)
+        db.add(kpi)
+        db.commit()
+        db.refresh(kpi)
+        mysql_success = True
+        mysql_id = kpi.id
+    except Exception as e:
+        logger.error(f"MySQL create_kpi failed: {e}")
+        db.rollback()
+
+    # Write to MongoDB
+    mongo_success = False
+    if mongo_db is not None:
+        try:
+            kpi_doc["id"] = mysql_id if mysql_success else -int(time.time())
+            kpi_doc["is_synced"] = mysql_success
+            mongo_db["kpi_records"].insert_one(kpi_doc)
+            mongo_success = True
+            if not mysql_success:
+                kpi = KPIRecord(**{k: v for k, v in kpi_doc.items() if k not in ["_id", "is_synced"]})
+        except Exception as e:
+            logger.error(f"MongoDB create_kpi failed: {e}")
+
+    if not mysql_success and not mongo_success:
+        raise HTTPException(status_code=500, detail="Database failure. Could not save KPI record.")
+
     return kpi
 
 
@@ -477,17 +567,41 @@ def list_kpis(
     current_user: dict = Depends(get_current_user)
 ):
     """List KPI records. Employees only see their own."""
-    query = db.query(KPIRecord)
-    if current_user["role"] == "Employee":
-        query = query.filter(KPIRecord.employee_id == current_user.get("employee_id"))
-    else:
-        if employee_id:
-            query = query.filter(KPIRecord.employee_id == employee_id)
-    if review_period:
-        query = query.filter(KPIRecord.review_period == review_period)
-    if category:
-        query = query.filter(KPIRecord.category == category)
-    return query.all()
+    mongo_client = get_mongo_client()
+    mongo_db = mongo_client[settings.MONGO_DB_NAME] if mongo_client else None
+
+    # Try MongoDB first
+    if mongo_db is not None:
+        try:
+            q = {}
+            if current_user["role"] == "Employee":
+                q["employee_id"] = current_user.get("employee_id")
+            else:
+                if employee_id: q["employee_id"] = employee_id
+            if review_period: q["review_period"] = review_period
+            if category: q["category"] = category
+            results = list(mongo_db["kpi_records"].find(q))
+            for r in results: r.pop("_id", None)
+            return results
+        except Exception as e:
+            logger.warning(f"MongoDB list_kpis failed: {e}. Falling back to MySQL.")
+
+    # Fallback to MySQL
+    try:
+        query = db.query(KPIRecord)
+        if current_user["role"] == "Employee":
+            query = query.filter(KPIRecord.employee_id == current_user.get("employee_id"))
+        else:
+            if employee_id:
+                query = query.filter(KPIRecord.employee_id == employee_id)
+        if review_period:
+            query = query.filter(KPIRecord.review_period == review_period)
+        if category:
+            query = query.filter(KPIRecord.category == category)
+        return query.all()
+    except Exception as e:
+        logger.error(f"MySQL list_kpis failed: {e}")
+        raise HTTPException(status_code=500, detail="Database failure. Could not fetch KPI records.")
 
 
 @router.get("/kpi/{id}", response_model=KPIResponseSchema)

@@ -3,6 +3,8 @@ from sqlalchemy.orm import Session
 from datetime import datetime
 from typing import List, Optional
 from pydantic import BaseModel
+import logging
+import time
 
 from app.db.mysql import get_mysql_session
 from app.db.mongo import get_mongo_client
@@ -10,6 +12,8 @@ from app.core.config import settings
 from app.models.mysql_models import User
 from app.models.performance_models import SalaryConfiguration, PayrollRecord
 from app.core.security import get_current_user
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/payroll", tags=["Payroll"])
 
@@ -73,37 +77,79 @@ def create_or_update_salary_configuration(
     if current_user["role"] not in ["Admin", "SuperAdmin"]:
         raise HTTPException(status_code=403, detail="Only Admins or SuperAdmins can manage salary configurations.")
 
-    existing_config = db.query(SalaryConfiguration).filter(
-        SalaryConfiguration.employee_id == config_data.employee_id
-    ).first()
+    mongo_client = get_mongo_client()
+    mongo_db = mongo_client[settings.MONGO_DB_NAME] if mongo_client else None
 
-    if existing_config:
-        # Update existing config
-        existing_config.base_salary = config_data.base_salary
-        existing_config.allowances = config_data.allowances
-        existing_config.deductions = config_data.deductions
-        existing_config.bank_name = config_data.bank_name
-        existing_config.account_number = config_data.account_number
-        existing_config.updated_at = datetime.utcnow()
-        db.commit()
-        db.refresh(existing_config)
-        return existing_config
-    else:
-        # Create new config
-        new_config = SalaryConfiguration(
-            employee_id=config_data.employee_id,
-            base_salary=config_data.base_salary,
-            allowances=config_data.allowances,
-            deductions=config_data.deductions,
-            bank_name=config_data.bank_name,
-            account_number=config_data.account_number,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
-        )
-        db.add(new_config)
-        db.commit()
-        db.refresh(new_config)
-        return new_config
+    # Try MySQL first
+    result_config = None
+    mysql_success = False
+    mysql_id = None
+    try:
+        existing_config = db.query(SalaryConfiguration).filter(
+            SalaryConfiguration.employee_id == config_data.employee_id
+        ).first()
+        if existing_config:
+            existing_config.base_salary = config_data.base_salary
+            existing_config.allowances = config_data.allowances
+            existing_config.deductions = config_data.deductions
+            existing_config.bank_name = config_data.bank_name
+            existing_config.account_number = config_data.account_number
+            existing_config.updated_at = datetime.utcnow()
+            db.commit()
+            db.refresh(existing_config)
+            result_config = existing_config
+        else:
+            new_config = SalaryConfiguration(
+                employee_id=config_data.employee_id,
+                base_salary=config_data.base_salary,
+                allowances=config_data.allowances,
+                deductions=config_data.deductions,
+                bank_name=config_data.bank_name,
+                account_number=config_data.account_number,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            db.add(new_config)
+            db.commit()
+            db.refresh(new_config)
+            result_config = new_config
+        mysql_success = True
+        mysql_id = result_config.id
+    except Exception as e:
+        logger.error(f"MySQL salary config failed: {e}")
+        db.rollback()
+
+    # Write to MongoDB
+    mongo_success = False
+    if mongo_db is not None:
+        try:
+            mongo_doc = {
+                "id": mysql_id if mysql_success else -int(time.time()),
+                "employee_id": config_data.employee_id,
+                "base_salary": config_data.base_salary,
+                "allowances": config_data.allowances,
+                "deductions": config_data.deductions,
+                "bank_name": config_data.bank_name,
+                "account_number": config_data.account_number,
+                "is_synced": mysql_success,
+                "created_at": result_config.created_at if mysql_success else datetime.utcnow(),
+                "updated_at": datetime.utcnow()
+            }
+            mongo_db["salary_configurations"].update_one(
+                {"employee_id": config_data.employee_id},
+                {"$set": mongo_doc},
+                upsert=True
+            )
+            mongo_success = True
+            if not mysql_success:
+                result_config = SalaryConfiguration(**{k: v for k, v in mongo_doc.items() if k not in ["_id", "is_synced"]})
+        except Exception as e:
+            logger.error(f"MongoDB salary config failed: {e}")
+
+    if result_config is None:
+        raise HTTPException(status_code=500, detail="Database failure. Could not save salary configuration.")
+
+    return result_config
 
 
 @router.get("/configurations/{employee_id}", response_model=SalaryConfigResponseSchema)
@@ -138,11 +184,27 @@ def generate_payroll_record(
     if current_user["role"] not in ["Admin", "SuperAdmin"]:
         raise HTTPException(status_code=403, detail="Only Admins or SuperAdmins can generate payroll records.")
 
+    mongo_client = get_mongo_client()
+    mongo_db = mongo_client[settings.MONGO_DB_NAME] if mongo_client else None
+
     # Check if payroll record already exists for this month
-    existing_record = db.query(PayrollRecord).filter(
-        PayrollRecord.employee_id == payload.employee_id,
-        PayrollRecord.month == payload.month
-    ).first()
+    existing_record = None
+    try:
+        existing_record = db.query(PayrollRecord).filter(
+            PayrollRecord.employee_id == payload.employee_id,
+            PayrollRecord.month == payload.month
+        ).first()
+    except Exception as e:
+        logger.warning(f"MySQL check existing payroll failed: {e}")
+        db.rollback()
+        if mongo_db is not None:
+            try:
+                existing_record = mongo_db["payroll_records"].find_one({
+                    "employee_id": payload.employee_id,
+                    "month": payload.month
+                })
+            except Exception:
+                pass
 
     if existing_record:
         raise HTTPException(
@@ -151,9 +213,22 @@ def generate_payroll_record(
         )
 
     # Fetch salary configuration
-    salary_config = db.query(SalaryConfiguration).filter(
-        SalaryConfiguration.employee_id == payload.employee_id
-    ).first()
+    salary_config = None
+    try:
+        salary_config = db.query(SalaryConfiguration).filter(
+            SalaryConfiguration.employee_id == payload.employee_id
+        ).first()
+    except Exception as e:
+        logger.warning(f"MySQL fetch salary config failed: {e}")
+        db.rollback()
+
+    if not salary_config and mongo_db is not None:
+        try:
+            salary_config_doc = mongo_db["salary_configurations"].find_one({"employee_id": payload.employee_id})
+            if salary_config_doc:
+                salary_config = SalaryConfiguration(**{k: v for k, v in salary_config_doc.items() if k not in ["_id", "is_synced"]})
+        except Exception:
+            pass
 
     if not salary_config:
         raise HTTPException(
@@ -166,9 +241,7 @@ def generate_payroll_record(
     total_working_days = 22 # Defaulting to 22 working days in a month
     
     try:
-        mongo_client = get_mongo_client()
-        if mongo_client:
-            mongo_db = mongo_client[settings.MONGO_DB_NAME]
+        if mongo_db is not None:
             timesheet = mongo_db["timesheets"].find_one({
                 "employee_id": payload.employee_id,
                 "month": payload.month
@@ -194,23 +267,68 @@ def generate_payroll_record(
     # Net Salary calculation
     net_salary = prorated_base_salary + salary_config.allowances - salary_config.deductions
 
-    new_record = PayrollRecord(
-        employee_id=payload.employee_id,
-        month=payload.month,
-        present_days=effective_present_days,
-        absent_days=absent_days,
-        total_working_days=total_working_days,
-        base_salary=prorated_base_salary,
-        allowances=salary_config.allowances,
-        deductions=salary_config.deductions,
-        net_salary=net_salary,
-        status="Draft",
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow()
-    )
-    db.add(new_record)
-    db.commit()
-    db.refresh(new_record)
+    # Write to MySQL
+    mysql_success = False
+    mysql_id = None
+    new_record = None
+    try:
+        new_record = PayrollRecord(
+            employee_id=payload.employee_id,
+            month=payload.month,
+            present_days=effective_present_days,
+            absent_days=absent_days,
+            total_working_days=total_working_days,
+            base_salary=prorated_base_salary,
+            allowances=salary_config.allowances,
+            deductions=salary_config.deductions,
+            net_salary=net_salary,
+            status="Draft",
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+        db.add(new_record)
+        db.commit()
+        db.refresh(new_record)
+        mysql_success = True
+        mysql_id = new_record.id
+    except Exception as e:
+        logger.error(f"MySQL create payroll record failed: {e}")
+        db.rollback()
+
+    # Write to MongoDB
+    mongo_success = False
+    if mongo_db is not None:
+        try:
+            pay_doc = {
+                "id": mysql_id if mysql_success else -int(time.time()),
+                "employee_id": payload.employee_id,
+                "month": payload.month,
+                "present_days": effective_present_days,
+                "absent_days": absent_days,
+                "total_working_days": total_working_days,
+                "base_salary": prorated_base_salary,
+                "allowances": salary_config.allowances,
+                "deductions": salary_config.deductions,
+                "net_salary": net_salary,
+                "status": "Draft",
+                "is_synced": mysql_success,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow()
+            }
+            mongo_db["payroll_records"].update_one(
+                {"employee_id": payload.employee_id, "month": payload.month},
+                {"$set": pay_doc},
+                upsert=True
+            )
+            mongo_success = True
+            if not mysql_success:
+                new_record = PayrollRecord(**{k: v for k, v in pay_doc.items() if k not in ["_id", "is_synced"]})
+        except Exception as e:
+            logger.error(f"MongoDB save payroll record failed: {e}")
+
+    if not mysql_success and not mongo_success:
+        raise HTTPException(status_code=500, detail="Database failure. Could not save payroll record.")
+
     return new_record
 
 
@@ -223,20 +341,41 @@ def list_payroll_records(
     current_user: dict = Depends(get_current_user)
 ):
     """List payroll records. Employees can only list their own"""
-    query = db.query(PayrollRecord)
-    
-    if current_user["role"] == "Employee":
-        query = query.filter(PayrollRecord.employee_id == current_user.get("employee_id"))
-    else:
-        if employee_id:
-            query = query.filter(PayrollRecord.employee_id == employee_id)
-            
-    if month:
-        query = query.filter(PayrollRecord.month == month)
-    if status:
-        query = query.filter(PayrollRecord.status == status)
-        
-    return query.all()
+    mongo_client = get_mongo_client()
+    mongo_db = mongo_client[settings.MONGO_DB_NAME] if mongo_client else None
+
+    # Try MongoDB first
+    if mongo_db is not None:
+        try:
+            q = {}
+            if current_user["role"] == "Employee":
+                q["employee_id"] = current_user.get("employee_id")
+            else:
+                if employee_id: q["employee_id"] = employee_id
+            if month: q["month"] = month
+            if status: q["status"] = status
+            results = list(mongo_db["payroll_records"].find(q))
+            for r in results: r.pop("_id", None)
+            return results
+        except Exception as e:
+            logger.warning(f"MongoDB list_payroll failed: {e}. Falling back to MySQL.")
+
+    # Fallback to MySQL
+    try:
+        query = db.query(PayrollRecord)
+        if current_user["role"] == "Employee":
+            query = query.filter(PayrollRecord.employee_id == current_user.get("employee_id"))
+        else:
+            if employee_id:
+                query = query.filter(PayrollRecord.employee_id == employee_id)
+        if month:
+            query = query.filter(PayrollRecord.month == month)
+        if status:
+            query = query.filter(PayrollRecord.status == status)
+        return query.all()
+    except Exception as e:
+        logger.error(f"MySQL list_payroll failed: {e}")
+        raise HTTPException(status_code=500, detail="Database failure. Could not fetch payroll records.")
 
 
 @router.get("/records/{id}", response_model=PayrollRecordResponseSchema)

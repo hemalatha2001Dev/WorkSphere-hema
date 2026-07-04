@@ -3,6 +3,8 @@ from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from typing import List, Optional
 from pydantic import BaseModel
+import logging
+import time
 
 from app.db.performance_db import get_performance_db
 from app.db.mysql import get_mysql_session
@@ -11,6 +13,8 @@ from app.core.config import settings
 from app.models.performance_models import RatingAllocation, Objective, KPIRecord
 from app.models.mysql_models import Task, User
 from app.core.security import get_current_user
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/rating", tags=["Automated Rating Allocation"])
 
@@ -200,11 +204,28 @@ def auto_allocate_rating(
     if current_user["role"] not in ["Admin", "SuperAdmin"]:
         raise HTTPException(status_code=403, detail="Only Admins or SuperAdmins can auto-allocate ratings.")
 
-    # Check if allocation already exists for this employee + period
-    existing = db_sqlite.query(RatingAllocation).filter(
-        RatingAllocation.employee_id == payload.employee_id,
-        RatingAllocation.review_period == payload.review_period
-    ).first()
+    mongo_client = get_mongo_client()
+    mongo_db = mongo_client[settings.MONGO_DB_NAME] if mongo_client else None
+
+    # Check if allocation already exists
+    existing = None
+    try:
+        existing = db_sqlite.query(RatingAllocation).filter(
+            RatingAllocation.employee_id == payload.employee_id,
+            RatingAllocation.review_period == payload.review_period
+        ).first()
+    except Exception as e:
+        logger.warning(f"MySQL duplicate rating check failed: {e}")
+        db_sqlite.rollback()
+        if mongo_db is not None:
+            try:
+                existing = mongo_db["rating_allocations"].find_one({
+                    "employee_id": payload.employee_id,
+                    "review_period": payload.review_period
+                })
+            except Exception:
+                pass
+
     if existing:
         raise HTTPException(
             status_code=400,
@@ -222,26 +243,55 @@ def auto_allocate_rating(
 
     rec_label, rec_value = score_to_rating(scores["calculated_score"])
 
-    allocation = RatingAllocation(
-        employee_id=payload.employee_id,
-        review_period=payload.review_period,
-        task_completion_rate=scores["task_completion_rate"],
-        okr_completion_rate=scores["okr_completion_rate"],
-        timesheet_hours=scores["timesheet_hours"],
-        kpi_score=scores["kpi_score"],
-        calculated_score=scores["calculated_score"],
-        recommended_rating=rec_label,
-        recommended_rating_value=rec_value,
-        allocated_rating=rec_label,       # Pre-fill with recommendation; manager can override
-        allocated_rating_value=rec_value,
-        status="Pending Review",
-        is_approved=False,
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow()
-    )
-    db_sqlite.add(allocation)
-    db_sqlite.commit()
-    db_sqlite.refresh(allocation)
+    alloc_doc = {
+        "employee_id": payload.employee_id,
+        "review_period": payload.review_period,
+        "task_completion_rate": scores["task_completion_rate"],
+        "okr_completion_rate": scores["okr_completion_rate"],
+        "timesheet_hours": scores["timesheet_hours"],
+        "kpi_score": scores["kpi_score"],
+        "calculated_score": scores["calculated_score"],
+        "recommended_rating": rec_label,
+        "recommended_rating_value": rec_value,
+        "allocated_rating": rec_label,
+        "allocated_rating_value": rec_value,
+        "status": "Pending Review",
+        "is_approved": False,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
+
+    # Write to MySQL
+    mysql_success = False
+    allocation = None
+    mysql_id = None
+    try:
+        allocation = RatingAllocation(**alloc_doc)
+        db_sqlite.add(allocation)
+        db_sqlite.commit()
+        db_sqlite.refresh(allocation)
+        mysql_success = True
+        mysql_id = allocation.id
+    except Exception as e:
+        logger.error(f"MySQL auto_allocate_rating failed: {e}")
+        db_sqlite.rollback()
+
+    # Write to MongoDB
+    mongo_success = False
+    if mongo_db is not None:
+        try:
+            alloc_doc["id"] = mysql_id if mysql_success else -int(time.time())
+            alloc_doc["is_synced"] = mysql_success
+            mongo_db["rating_allocations"].insert_one(alloc_doc)
+            mongo_success = True
+            if not mysql_success:
+                allocation = RatingAllocation(**{k: v for k, v in alloc_doc.items() if k not in ["_id", "is_synced"]})
+        except Exception as e:
+            logger.error(f"MongoDB auto_allocate_rating failed: {e}")
+
+    if not mysql_success and not mongo_success:
+        raise HTTPException(status_code=500, detail="Database failure. Could not save rating allocation.")
+
     return allocation
 
 
@@ -254,17 +304,41 @@ def list_rating_allocations(
     current_user: dict = Depends(get_current_user)
 ):
     """List all rating allocations with optional filters. Employees only see their own."""
-    query = db.query(RatingAllocation)
-    if current_user["role"] == "Employee":
-        query = query.filter(RatingAllocation.employee_id == current_user.get("employee_id"))
-    else:
-        if employee_id:
-            query = query.filter(RatingAllocation.employee_id == employee_id)
-    if review_period:
-        query = query.filter(RatingAllocation.review_period == review_period)
-    if status:
-        query = query.filter(RatingAllocation.status == status)
-    return query.order_by(RatingAllocation.created_at.desc()).all()
+    mongo_client = get_mongo_client()
+    mongo_db = mongo_client[settings.MONGO_DB_NAME] if mongo_client else None
+
+    # Try MongoDB first
+    if mongo_db is not None:
+        try:
+            q = {}
+            if current_user["role"] == "Employee":
+                q["employee_id"] = current_user.get("employee_id")
+            else:
+                if employee_id: q["employee_id"] = employee_id
+            if review_period: q["review_period"] = review_period
+            if status: q["status"] = status
+            results = list(mongo_db["rating_allocations"].find(q).sort("created_at", -1))
+            for r in results: r.pop("_id", None)
+            return results
+        except Exception as e:
+            logger.warning(f"MongoDB list_allocations failed: {e}. Falling back to MySQL.")
+
+    # Fallback to MySQL
+    try:
+        query = db.query(RatingAllocation)
+        if current_user["role"] == "Employee":
+            query = query.filter(RatingAllocation.employee_id == current_user.get("employee_id"))
+        else:
+            if employee_id:
+                query = query.filter(RatingAllocation.employee_id == employee_id)
+        if review_period:
+            query = query.filter(RatingAllocation.review_period == review_period)
+        if status:
+            query = query.filter(RatingAllocation.status == status)
+        return query.order_by(RatingAllocation.created_at.desc()).all()
+    except Exception as e:
+        logger.error(f"MySQL list_allocations failed: {e}")
+        raise HTTPException(status_code=500, detail="Database failure. Could not fetch rating allocations.")
 
 
 @router.get("/allocations/{id}", response_model=RatingAllocationResponseSchema)

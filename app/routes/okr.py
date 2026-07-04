@@ -3,11 +3,17 @@ from sqlalchemy.orm import Session
 from datetime import datetime
 from typing import List, Optional
 from pydantic import BaseModel
+import logging
+import time
 
 from app.db.performance_db import get_performance_db
+from app.db.mongo import get_mongo_client
+from app.core.config import settings
 from app.models.performance_models import Objective, KeyResult
 from app.models.mysql_models import User
 from app.core.security import get_current_user
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/okr", tags=["OKR"])
 
@@ -114,69 +120,167 @@ def create_objective(
     current_user: dict = Depends(get_current_user)
 ):
     """Create objective and its associated key results"""
+    mongo_client = get_mongo_client()
+    mongo_db = mongo_client[settings.MONGO_DB_NAME] if mongo_client else None
+
     # Permission check: Employee can only create their own OKRs
     if current_user["role"] == "Employee" and current_user.get("employee_id") != obj_data.employee_id:
         raise HTTPException(status_code=403, detail="Employees can only create OKRs for themselves.")
 
-    # Verify employee exists
-    employee = db.query(User).filter(User.employee_id == obj_data.employee_id).first()
+    # 1. Verify employee exists (SQL fallback to Mongo)
+    employee = None
+    try:
+        employee = db.query(User).filter(User.employee_id == obj_data.employee_id).first()
+    except Exception as e:
+        logger.warning(f"MySQL employee check failed: {e}")
+        db.rollback()
+
+    if not employee and mongo_db is not None:
+        try:
+            employee = mongo_db["users"].find_one({"employee_id": obj_data.employee_id})
+        except Exception:
+            pass
+            
     if not employee:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Employee with ID '{obj_data.employee_id}' not found."
         )
 
-    # Check for duplicate objective title for the same employee
-    existing_obj = db.query(Objective).filter(
-        Objective.employee_id == obj_data.employee_id,
-        Objective.title == obj_data.title
-    ).first()
+    # 2. Check for duplicate objective
+    existing_obj = None
+    try:
+        existing_obj = db.query(Objective).filter(
+            Objective.employee_id == obj_data.employee_id,
+            Objective.title == obj_data.title
+        ).first()
+    except Exception as e:
+        logger.warning(f"MySQL duplicate check failed: {e}")
+        db.rollback()
+        
+    if not existing_obj and mongo_db is not None:
+        try:
+            existing_obj = mongo_db["objectives"].find_one({
+                "employee_id": obj_data.employee_id,
+                "title": obj_data.title
+            })
+        except Exception:
+            pass
+
     if existing_obj:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"An objective with the title '{obj_data.title}' already exists for employee '{obj_data.employee_id}'."
         )
 
-    new_obj = Objective(
-        title=obj_data.title,
-        description=obj_data.description,
-        employee_id=obj_data.employee_id,
-        department=obj_data.department or current_user.get("department"),
-        start_date=obj_data.start_date,
-        target_date=obj_data.target_date,
-        status=obj_data.status or "Pending",
-        progress=0.0,
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow()
-    )
-    db.add(new_obj)
-    db.commit()
-    db.refresh(new_obj)
-
-    # Add key results if any
-    for kr_data in obj_data.key_results:
-        denom = kr_data.target_value if kr_data.target_value != 0 else 1.0
-        kr_progress = min(max((kr_data.current_value / denom) * 100.0, 0.0), 100.0)
-        
-        kr = KeyResult(
-            objective_id=new_obj.id,
-            title=kr_data.title,
-            target_value=kr_data.target_value,
-            current_value=kr_data.current_value,
-            unit=kr_data.unit,
-            weight=kr_data.weight,
-            progress=kr_progress,
+    # 3. Create Objective (SQL)
+    mysql_success = False
+    mysql_id = None
+    new_obj = None
+    
+    try:
+        new_obj = Objective(
+            title=obj_data.title,
+            description=obj_data.description,
+            employee_id=obj_data.employee_id,
+            department=obj_data.department or current_user.get("department"),
+            start_date=obj_data.start_date,
+            target_date=obj_data.target_date,
+            status=obj_data.status or "Pending",
+            progress=0.0,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()
         )
-        db.add(kr)
-    
-    db.commit()
-    db.refresh(new_obj)
-    
-    # Recalculate progress to update parent objective
-    update_objective_progress(new_obj, db)
-    db.refresh(new_obj)
+        db.add(new_obj)
+        db.commit()
+        db.refresh(new_obj)
+        mysql_success = True
+        mysql_id = new_obj.id
+        
+        # Add key results to SQL
+        for kr_data in obj_data.key_results:
+            denom = kr_data.target_value if kr_data.target_value != 0 else 1.0
+            kr_progress = min(max((kr_data.current_value / denom) * 100.0, 0.0), 100.0)
+            kr = KeyResult(
+                objective_id=new_obj.id,
+                title=kr_data.title,
+                target_value=kr_data.target_value,
+                current_value=kr_data.current_value,
+                unit=kr_data.unit,
+                weight=kr_data.weight,
+                progress=kr_progress,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            db.add(kr)
+        db.commit()
+        db.refresh(new_obj)
+        
+        # Recalculate progress to update parent objective
+        update_objective_progress(new_obj, db)
+        db.refresh(new_obj)
+        
+    except Exception as e:
+        logger.error(f"MySQL create objective failed: {e}")
+        db.rollback()
+
+    # 4. Create Objective (Mongo)
+    mongo_success = False
+    if mongo_db is not None:
+        try:
+            obj_id_val = mysql_id if mysql_success else -int(time.time())
+            mongo_doc = {
+                "id": obj_id_val,
+                "title": obj_data.title,
+                "description": obj_data.description,
+                "employee_id": obj_data.employee_id,
+                "department": obj_data.department or current_user.get("department"),
+                "start_date": obj_data.start_date,
+                "target_date": obj_data.target_date,
+                "status": obj_data.status or "Pending",
+                "progress": 0.0,
+                "is_synced": mysql_success,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow()
+            }
+            mongo_db["objectives"].insert_one(mongo_doc)
+            
+            # Handle KRs in Mongo
+            kr_list = []
+            for kr_data in obj_data.key_results:
+                denom = kr_data.target_value if kr_data.target_value != 0 else 1.0
+                kr_progress = min(max((kr_data.current_value / denom) * 100.0, 0.0), 100.0)
+                kr_doc = {
+                    "id": -int(time.time() + len(kr_list)),
+                    "objective_id": obj_id_val,
+                    "title": kr_data.title,
+                    "target_value": kr_data.target_value,
+                    "current_value": kr_data.current_value,
+                    "unit": kr_data.unit,
+                    "weight": kr_data.weight,
+                    "progress": kr_progress,
+                    "is_synced": mysql_success,
+                    "created_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow()
+                }
+                mongo_db["key_results"].insert_one(kr_doc)
+                kr_list.append(kr_doc)
+                
+            mongo_success = True
+            
+            if not mysql_success:
+                new_obj = Objective(**{k: v for k, v in mongo_doc.items() if k not in ["_id", "is_synced"]})
+                new_obj.key_results = [KeyResult(**{k: v for k, v in kr.items() if k not in ["_id", "is_synced"]}) for kr in kr_list]
+                total_weight = sum([kr.weight if kr.weight is not None else 1.0 for kr in new_obj.key_results])
+                weighted_progress = sum([(kr.progress * (kr.weight if kr.weight is not None else 1.0)) for kr in new_obj.key_results])
+                new_obj.progress = round(weighted_progress / total_weight, 2) if total_weight > 0 else 0.0
+                
+        except Exception as e:
+            logger.error(f"Mongo create objective failed: {e}")
+
+    if not mysql_success and not mongo_success:
+        raise HTTPException(status_code=500, detail="Database failure. Could not save objective.")
+        
     return new_obj
 
 
@@ -189,23 +293,58 @@ def list_objectives(
     current_user: dict = Depends(get_current_user)
 ):
     """List objectives with filters and role-based permissions"""
-    query = db.query(Objective)
-    
-    # Role-based restriction
-    if current_user["role"] == "Employee":
-        # Employees can only see their own OKRs
-        query = query.filter(Objective.employee_id == current_user.get("employee_id"))
-    else:
-        # Admins and SuperAdmins can filter
-        if employee_id:
-            query = query.filter(Objective.employee_id == employee_id)
-        if department:
-            query = query.filter(Objective.department == department)
+    mongo_client = get_mongo_client()
+    mongo_db = mongo_client[settings.MONGO_DB_NAME] if mongo_client else None
+
+    # 1. Try Mongo FIRST for faster reads
+    if mongo_db is not None:
+        try:
+            mongo_query = {}
+            if current_user["role"] == "Employee":
+                mongo_query["employee_id"] = current_user.get("employee_id")
+            else:
+                if employee_id:
+                    mongo_query["employee_id"] = employee_id
+                if department:
+                    mongo_query["department"] = department
+            if status:
+                mongo_query["status"] = status
+                
+            mongo_objs = list(mongo_db["objectives"].find(mongo_query))
             
-    if status:
-        query = query.filter(Objective.status == status)
+            # For each objective, we also need its key_results to satisfy response_model
+            result_list = []
+            for m_obj in mongo_objs:
+                m_obj["key_results"] = list(mongo_db["key_results"].find({"objective_id": m_obj["id"]}))
+                m_obj.pop("_id", None)
+                for kr in m_obj["key_results"]:
+                    kr.pop("_id", None)
+                result_list.append(m_obj)
+                
+            return result_list
+        except Exception as e:
+            logger.warning(f"Mongo list_objectives failed: {e}. Falling back to MySQL.")
+
+    # 2. Fallback to MySQL
+    try:
+        query = db.query(Objective)
         
-    return query.all()
+        # Role-based restriction
+        if current_user["role"] == "Employee":
+            query = query.filter(Objective.employee_id == current_user.get("employee_id"))
+        else:
+            if employee_id:
+                query = query.filter(Objective.employee_id == employee_id)
+            if department:
+                query = query.filter(Objective.department == department)
+                
+        if status:
+            query = query.filter(Objective.status == status)
+            
+        return query.all()
+    except Exception as e:
+        logger.error(f"MySQL list_objectives failed: {e}")
+        raise HTTPException(status_code=500, detail="Database failure. Could not fetch objectives.")
 
 
 @router.get("/objectives/{id}", response_model=ObjectiveResponseSchema)

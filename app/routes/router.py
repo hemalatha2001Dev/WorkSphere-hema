@@ -12,6 +12,7 @@ from app.routes.okr import router as okr_router
 from app.routes.payroll import router as payroll_router
 from app.routes.performance import router as performance_router
 from app.routes.rating import router as rating_router
+from app.routes.attendance import router as attendance_router
 
 api_router = APIRouter()
 
@@ -27,3 +28,4 @@ api_router.include_router(okr_router)
 api_router.include_router(payroll_router)
 api_router.include_router(performance_router)
 api_router.include_router(rating_router)
+api_router.include_router(attendance_router)
