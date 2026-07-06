@@ -118,3 +118,4 @@ uploads/**/*.png
 !requirements.txt
 !Readme.md
 !app/
+app/worksphere-490606-3667ec0def14.json

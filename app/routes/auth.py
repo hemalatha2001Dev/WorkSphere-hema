@@ -143,6 +143,7 @@ def register_user(user: RegisterSchema):
     # ✅ Hash password
     user_dict["password"] = hash_password(plain_password)
 
+
     try:
         # MongoDB PRIMARY creation
         mongo_id = create_user_mongo(user_dict)

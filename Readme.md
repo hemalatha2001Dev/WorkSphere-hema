@@ -161,9 +161,3 @@ MONGO_DB_URL mongodb+srv://devtestkarthik_db_user:JY8ocxjnAl3OTrtz@cluster0.5hkj
 MONGO_DB_NAME manger_db
 GCS_BUCKET_NAME workspehere-bukcet
 SECRET_KEY supersecretkey
-==
-
-### GIT BRANCHES 
-feature/worksphere-v1.0-hema : Developement
-feature/worksphere-v1.0-sirisha : DevelopementGg
-main : dont push the code in the main

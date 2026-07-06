@@ -396,17 +396,25 @@ def create_project(
             valid_usernames = set()
 
             # Try MongoDB first to fetch users
-            if mongo_client:
-                mongo_db = mongo_client[settings.MONGO_DB_NAME]
-                users = mongo_db["users"].find({"department": user_department, "is_deleted": {"$ne": True}})
-                valid_usernames = {user["username"] for user in users}
-            else:
+            try:
+                if mongo_client:
+                    mongo_db = mongo_client[settings.MONGO_DB_NAME]
+                    users = mongo_db["users"].find({"department": user_department, "is_deleted": {"$ne": True}})
+                    valid_usernames = {user["username"] for user in users}
+            except Exception as e:
+                logger.warning(f"MongoDB user validation failed: {e}")
+                mongo_client = None
+
+            if not valid_usernames or not mongo_client:
                 # Fallback to MySQL
-                from app.models.mysql_models import User  # Import here to avoid circular imports
-                users = db.query(User).filter(
-                    and_(User.department == user_department, User.is_deleted == False)
-                ).all()
-                valid_usernames = {user.username for user in users}
+                try:
+                    from app.models.mysql_models import User  # Import here to avoid circular imports
+                    users = db.query(User).filter(
+                        and_(User.department == user_department, User.is_deleted == False)
+                    ).all()
+                    valid_usernames = {user.username for user in users}
+                except Exception as e:
+                    logger.error(f"MySQL user validation failed: {e}")
 
             # Validate project_admins
             project_admins = base_data.get("project_admins", [])
@@ -424,57 +432,77 @@ def create_project(
                     detail="One or more team members are not in your department"
                 )
 
-        # Create in Mongo FIRST with numeric id via counters using a COPY
-        mongo_client = get_mongo_client()
-        mongo_id_val = None
-        if mongo_client:
-            mongo_db = mongo_client[settings.MONGO_DB_NAME]
-            seq = mongo_db["counters"].find_one_and_update(
-                {"_id": "project_id"},
-                {"$inc": {"seq": 1}},
-                upsert=True,
-                return_document=ReturnDocument.AFTER,
-            )
-            project_id_val = int(seq.get("seq", 1))
-
-            mongo_project = dict(base_data)
-            mongo_project["id"] = project_id_val
-            # Convert deadline to datetime for Mongo only
-            if original_deadline_str:
-                try:
-                    mongo_project["deadline"] = datetime.fromisoformat(
-                        original_deadline_str.replace("Z", "+00:00")
-                    )
-                except ValueError:
-                    raise HTTPException(
-                        status_code=400, detail="Invalid deadline format"
-                    )
-            mongo_project.setdefault("created_at", datetime.utcnow())
-            mongo_project.setdefault("updated_at", datetime.utcnow())
-            mongo_project.setdefault("is_deleted", False)
-            mongo_db["projects"].insert_one(mongo_project)
-            mongo_id_val = project_id_val
-
         # Prepare clean data for MySQL (no Mongo _id, deadline stays as string)
         sql_project = dict(base_data)
         sql_project.pop("_id", None)
         sql_project.setdefault("is_deleted", False)
 
-        # Mirror to MySQL (fallback store)
-        db_project = Project(**sql_project)
-        db.add(db_project)
-        db.commit()
-        db.refresh(db_project)
+        mysql_success = False
+        mysql_id_val = None
+        
+        # 1. Try MySQL First (Usually it's the primary, and gives the auto-increment ID)
+        try:
+            db_project = Project(**sql_project)
+            db.add(db_project)
+            db.commit()
+            db.refresh(db_project)
+            mysql_success = True
+            mysql_id_val = db_project.id
+        except Exception as e:
+            db.rollback()
+            logger.error(f"MySQL project write failed: {e}")
+
+        # 2. Try Mongo Write
+        mongo_success = False
+        mongo_id_val = None
+        try:
+            mongo_client = get_mongo_client()
+            if mongo_client:
+                mongo_db = mongo_client[settings.MONGO_DB_NAME]
+                
+                # If MySQL succeeded, use its ID. Otherwise, use the Mongo counter.
+                if mysql_success:
+                    project_id_val = mysql_id_val
+                else:
+                    seq = mongo_db["counters"].find_one_and_update(
+                        {"_id": "project_id"},
+                        {"$inc": {"seq": 1}},
+                        upsert=True,
+                        return_document=ReturnDocument.AFTER,
+                    )
+                    project_id_val = int(seq.get("seq", 1))
+
+                mongo_project = dict(base_data)
+                mongo_project["id"] = project_id_val
+                
+                # Convert deadline to datetime for Mongo only
+                if original_deadline_str:
+                    mongo_project["deadline"] = datetime.fromisoformat(
+                        original_deadline_str.replace("Z", "+00:00")
+                    )
+                
+                mongo_project.setdefault("created_at", datetime.utcnow())
+                mongo_project.setdefault("updated_at", datetime.utcnow())
+                mongo_project.setdefault("is_deleted", False)
+                mongo_db["projects"].insert_one(mongo_project)
+                mongo_success = True
+                mongo_id_val = project_id_val
+        except ValueError:
+            # Re-raise deadline format errors
+            raise HTTPException(status_code=400, detail="Invalid deadline format")
+        except Exception as e:
+            logger.error(f"MongoDB project write failed: {e}")
+
+        if not mysql_success and not mongo_success:
+            raise HTTPException(status_code=500, detail="Error creating project: Both databases failed")
 
         return {
             "message": "Project created successfully",
-            "project_id": mongo_id_val or db_project.id,
+            "project_id": mysql_id_val or mongo_id_val,
         }
     except HTTPException:
-        db.rollback()
         raise
     except Exception as e:
-        db.rollback()
         raise HTTPException(status_code=500, detail=f"Error creating project: {str(e)}")
     
 # UNIFIED GET PROJECTS ENDPOINT - Replaces /search, /status/{status}, and default /
@@ -505,102 +533,110 @@ def get_projects(
             return status_progress.get(project_status, 0)
 
         # Try MongoDB first
-        mongo_client = get_mongo_client()
-        if mongo_client:
-            mongo_db = mongo_client[settings.MONGO_DB_NAME]
+        try:
+            mongo_client = get_mongo_client()
+            if mongo_client:
+                mongo_db = mongo_client[settings.MONGO_DB_NAME]
+    
+                # Build MongoDB query
+                mongo_query: dict = {"is_deleted": {"$ne": True}}
+    
+                # Apply search filter if provided
+                if search_query:
+                    mongo_query["$or"] = [
+                        {"project_name": {"$regex": search_query, "$options": "i"}},
+                        {"description": {"$regex": search_query, "$options": "i"}},
+                        {"department": {"$regex": search_query, "$options": "i"}},
+                    ]
+    
+                # Apply status filter if provided
+                if status:
+                    mongo_query["project_status"] = status
+    
+                # Apply role-based access control using centralized filter
+                mongo_query = apply_role_based_filter_mongo_projects(
+                    mongo_query, current_user
+                )
+    
+                # Execute query
+                mongo_projects = list(
+                    mongo_db["projects"]
+                    .find(mongo_query, {"_id": 0})
+                    .skip(skip)
+                    .limit(page_size)
+                )
+    
+                total_projects = mongo_db["projects"].count_documents(mongo_query)
+    
+                # Add progress calculation to each project
+                for project in mongo_projects:
+                    project["progress"] = calculate_progress(project.get("project_status"))
+                
+                return {
+                    "source": "mongo",
+                    "page": page,
+                    "page_size": page_size,
+                    "total_pages": (total_projects + page_size - 1) // page_size,
+                    "total_projects": total_projects,
+                    "data": mongo_projects,
+                    "filters_applied": {
+                        "search": search_query or None,
+                        "status": status or None,
+                    },
+                }
+        except Exception as mongo_err:
+            logger.warning(f"MongoDB get_projects failed: {mongo_err}. Falling back to MySQL.")
 
-            # Build MongoDB query
-            mongo_query: dict = {"is_deleted": {"$ne": True}}
-
+        # Fallback to MySQL (only if MongoDB is not available)
+        try:
+            query = db.query(Project).filter(Project.is_deleted == False)
+    
             # Apply search filter if provided
             if search_query:
-                mongo_query["$or"] = [
-                    {"project_name": {"$regex": search_query, "$options": "i"}},
-                    {"description": {"$regex": search_query, "$options": "i"}},
-                    {"department": {"$regex": search_query, "$options": "i"}},
-                ]
-
+                query = query.filter(
+                    or_(
+                        Project.project_name.ilike(f"%{search_query}%"),
+                        Project.description.ilike(f"%{search_query}%"),
+                        Project.department.ilike(f"%{search_query}%"),
+                    )
+                )
+    
             # Apply status filter if provided
             if status:
-                mongo_query["project_status"] = status
-
-            # Apply role-based access control using centralized filter
-            mongo_query = apply_role_based_filter_mongo_projects(
-                mongo_query, current_user
-            )
-
-            # Execute query
-            mongo_projects = list(
-                mongo_db["projects"]
-                .find(mongo_query, {"_id": 0})
-                .skip(skip)
-                .limit(page_size)
-            )
-
-            total_projects = mongo_db["projects"].count_documents(mongo_query)
-
-            # Add progress calculation to each project
-            for project in mongo_projects:
-                project["progress"] = calculate_progress(project.get("project_status"))
-            
+                query = query.filter(Project.project_status == status)
+    
+            # Apply role-based access control
+            query = apply_role_based_filter_projects(query, current_user)
+    
+            total_projects = query.count()
+            mysql_projects = query.offset(skip).limit(page_size).all()
+    
+            projects_list = []
+            for project in mysql_projects:
+                project_dict = {
+                    k: v for k, v in project.__dict__.items() if not k.startswith("_")
+                }
+                # Add progress calculation
+                project_dict["progress"] = calculate_progress(project.project_status)
+                projects_list.append(project_dict)
+    
             return {
-                "source": "mongo",
+                "source": "mysql",
                 "page": page,
                 "page_size": page_size,
                 "total_pages": (total_projects + page_size - 1) // page_size,
                 "total_projects": total_projects,
-                "data": mongo_projects,
+                "data": projects_list,
                 "filters_applied": {
                     "search": search_query or None,
                     "status": status or None,
                 },
             }
-
-        # Fallback to MySQL (only if MongoDB is not available)
-        query = db.query(Project).filter(Project.is_deleted == False)
-
-        # Apply search filter if provided
-        if search_query:
-            query = query.filter(
-                or_(
-                    Project.project_name.ilike(f"%{search_query}%"),
-                    Project.description.ilike(f"%{search_query}%"),
-                    Project.department.ilike(f"%{search_query}%"),
-                )
-            )
-
-        # Apply status filter if provided
-        if status:
-            query = query.filter(Project.project_status == status)
-
-        # Apply role-based access control
-        query = apply_role_based_filter_projects(query, current_user)
-
-        total_projects = query.count()
-        mysql_projects = query.offset(skip).limit(page_size).all()
-
-        projects_list = []
-        for project in mysql_projects:
-            project_dict = {
-                k: v for k, v in project.__dict__.items() if not k.startswith("_")
-            }
-            # Add progress calculation
-            project_dict["progress"] = calculate_progress(project.project_status)
-            projects_list.append(project_dict)
-
-        return {
-            "source": "mysql",
-            "page": page,
-            "page_size": page_size,
-            "total_pages": (total_projects + page_size - 1) // page_size,
-            "total_projects": total_projects,
-            "data": projects_list,
-            "filters_applied": {
-                "search": search_query or None,
-                "status": status or None,
-            },
-        }
-
+        except Exception as mysql_err:
+            logger.error(f"MySQL get_projects failed: {mysql_err}")
+            raise HTTPException(status_code=500, detail="Both databases are unavailable.")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Error fetching projects: {str(e)}"
@@ -629,49 +665,59 @@ def get_project_by_id(
             return status_progress.get(project_status, 0)
 
         # Try MongoDB first
-        mongo_client = get_mongo_client()
-        if mongo_client:
-            mongo_db = mongo_client[settings.MONGO_DB_NAME]
-            # Build MongoDB query with role-based access control
-            mongo_query = {"is_deleted": {"$ne": True}}
-
-            # Apply role-based access control
-            mongo_query = apply_role_based_filter_mongo_projects(
-                mongo_query, current_user
-            )
-
-            # Add project_id filter
-            # Try int id first, then legacy string id
-            mongo_query["id"] = project_id
-            mongo_project = mongo_db["projects"].find_one(mongo_query, {"_id": 0})
-
-            if not mongo_project:
-                # Try legacy string id
-                mongo_query["id"] = str(project_id)
+        try:
+            mongo_client = get_mongo_client()
+            if mongo_client:
+                mongo_db = mongo_client[settings.MONGO_DB_NAME]
+                # Build MongoDB query with role-based access control
+                mongo_query = {"is_deleted": {"$ne": True}}
+    
+                # Apply role-based access control
+                mongo_query = apply_role_based_filter_mongo_projects(
+                    mongo_query, current_user
+                )
+    
+                # Add project_id filter
+                # Try int id first, then legacy string id
+                mongo_query["id"] = project_id
                 mongo_project = mongo_db["projects"].find_one(mongo_query, {"_id": 0})
-
-            if mongo_project:
-                mongo_project["progress"] = calculate_progress(mongo_project.get("project_status"))
-                return {"source": "mongo", "project": mongo_project}
-            else:
-                # Return not found from MongoDB
-                raise HTTPException(status_code=404, detail="Project not found")
+    
+                if not mongo_project:
+                    # Try legacy string id
+                    mongo_query["id"] = str(project_id)
+                    mongo_project = mongo_db["projects"].find_one(mongo_query, {"_id": 0})
+    
+                if mongo_project:
+                    mongo_project["progress"] = calculate_progress(mongo_project.get("project_status"))
+                    return {"source": "mongo", "project": mongo_project}
+                else:
+                    # If found in mongo_db but no project matches, we still check MySQL
+                    # This happens if it was inserted into MySQL manually.
+                    pass
+        except Exception as mongo_err:
+            logger.warning(f"MongoDB get_project_by_id failed: {mongo_err}. Falling back to MySQL.")
 
         # Fallback to MySQL (only if MongoDB is not available)
-        query = db.query(Project).filter(
-            and_(Project.id == project_id, Project.is_deleted == False)
-        )
-        query = apply_role_based_filter_projects(query, current_user)
-
-        project = query.first()
-        if not project:
-            raise HTTPException(status_code=404, detail="Project not found")
-
-        project_dict = {
-            k: v for k, v in project.__dict__.items() if not k.startswith("_")
-        }
-        project_dict["progress"] = calculate_progress(project.project_status)
-        return {"source": "mysql", "project": project_dict}
+        try:
+            query = db.query(Project).filter(
+                and_(Project.id == project_id, Project.is_deleted == False)
+            )
+            query = apply_role_based_filter_projects(query, current_user)
+    
+            project = query.first()
+            if not project:
+                raise HTTPException(status_code=404, detail="Project not found")
+    
+            project_dict = {
+                k: v for k, v in project.__dict__.items() if not k.startswith("_")
+            }
+            project_dict["progress"] = calculate_progress(project.project_status)
+            return {"source": "mysql", "project": project_dict}
+        except HTTPException:
+            raise
+        except Exception as mysql_err:
+            logger.error(f"MySQL get_project_by_id failed: {mysql_err}")
+            raise HTTPException(status_code=500, detail="Both databases are unavailable.")
     except HTTPException:
         raise
     except Exception as e:
@@ -699,40 +745,52 @@ def update_project(
             )
 
         # Update Mongo FIRST
-        mongo_client = get_mongo_client()
-        if mongo_client:
-            mongo_db = mongo_client[settings.MONGO_DB_NAME]
-            # Set updated_at field as well
-            update_data["updated_at"] = datetime.utcnow()
-            mongo_db["projects"].update_one({"id": project_id}, {"$set": update_data})
+        mongo_success = False
+        try:
+            mongo_client = get_mongo_client()
+            if mongo_client:
+                mongo_db = mongo_client[settings.MONGO_DB_NAME]
+                # Set updated_at field as well
+                update_data["updated_at"] = datetime.utcnow()
+                mongo_db["projects"].update_one({"id": project_id}, {"$set": update_data})
+                mongo_success = True
+        except Exception as mongo_err:
+            logger.warning(f"MongoDB update failed: {mongo_err}")
 
         # Then update MySQL (fallback/mirror)
-        existing_project = (
-            db.query(Project)
-            .filter(and_(Project.id == project_id, Project.is_deleted == False))
-            .first()
-        )
-        if not existing_project:
-            # If not in MySQL but updated in Mongo, still succeed
-            if mongo_client:
-                return {
-                    "message": "Project updated successfully",
-                    "project_id": project_id,
-                }
-            raise HTTPException(status_code=404, detail="Project not found")
-        # Allow Admin/SuperAdmin updates; restrict Employees by department membership
-        if current_user.get("role") not in ("Admin", "SuperAdmin"):
-            if existing_project.department != current_user.get("department"):
-                raise HTTPException(status_code=403, detail="Access denied")
+        mysql_success = False
+        try:
+            existing_project = (
+                db.query(Project)
+                .filter(and_(Project.id == project_id, Project.is_deleted == False))
+                .first()
+            )
+            if existing_project:
+                # Allow Admin/SuperAdmin updates; restrict Employees by department membership
+                if current_user.get("role") not in ("Admin", "SuperAdmin"):
+                    if existing_project.department != current_user.get("department"):
+                        raise HTTPException(status_code=403, detail="Access denied")
+        
+                # 2. Apply updates to the SQL model
+                for key, value in update_data.items():
+                    if (
+                        key != "updated_at"
+                    ):  # updated_at will be handled implicitly by SQLAlchemy or set explicitly if needed
+                        setattr(existing_project, key, value)
+        
+                db.commit()
+                mysql_success = True
+            elif not mongo_success:
+                raise HTTPException(status_code=404, detail="Project not found")
+        except HTTPException:
+            raise
+        except Exception as mysql_err:
+            db.rollback()
+            logger.error(f"MySQL update failed: {mysql_err}")
+            
+        if not mysql_success and not mongo_success:
+            raise HTTPException(status_code=500, detail="Failed to update project in both databases")
 
-        # 2. Apply updates to the SQL model
-        for key, value in update_data.items():
-            if (
-                key != "updated_at"
-            ):  # updated_at will be handled implicitly by SQLAlchemy or set explicitly if needed
-                setattr(existing_project, key, value)
-
-        db.commit()
         return {"message": "Project updated successfully", "project_id": project_id}
     except HTTPException:
         raise
@@ -760,10 +818,14 @@ def delete_project(
         mongo_client = get_mongo_client()
         mongo_db = mongo_client[settings.MONGO_DB_NAME] if mongo_client else None
         mongo_project_doc = None
-        if mongo_db is not None:
-            mongo_project_doc = mongo_db["projects"].find_one(
-                {"id": project_id}
-            ) or mongo_db["projects"].find_one({"id": str(project_id)})
+        try:
+            if mongo_db is not None:
+                mongo_project_doc = mongo_db["projects"].find_one(
+                    {"id": project_id}
+                ) or mongo_db["projects"].find_one({"id": str(project_id)})
+        except Exception as e:
+            logger.warning(f"MongoDB read failed during delete check: {e}")
+            
         if existing_project is None and mongo_project_doc is None:
             raise HTTPException(status_code=404, detail="Project not found")
 
@@ -801,29 +863,36 @@ def delete_project(
 
         # Soft delete in Mongo FIRST (verify result and fallback to string id)
         mongo_deleted = False
-        if mongo_db is not None:
-            result = mongo_db["projects"].update_one(
-                {"id": project_id}, {"$set": {"is_deleted": True}}
-            )
-            if result.matched_count == 0:
-                # fallback for legacy string ids
+        try:
+            if mongo_db is not None:
                 result = mongo_db["projects"].update_one(
-                    {"id": str(project_id)}, {"$set": {"is_deleted": True}}
+                    {"id": project_id}, {"$set": {"is_deleted": True}}
                 )
-            mongo_deleted = result.modified_count > 0
-            try:
-                print(
-                    f"delete_project id={project_id} mongo matched={result.matched_count} modified={result.modified_count}"
-                )
-            except Exception:
-                pass
+                if result.matched_count == 0:
+                    # fallback for legacy string ids
+                    result = mongo_db["projects"].update_one(
+                        {"id": str(project_id)}, {"$set": {"is_deleted": True}}
+                    )
+                mongo_deleted = result.modified_count > 0
+                try:
+                    print(
+                        f"delete_project id={project_id} mongo matched={result.matched_count} modified={result.modified_count}"
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"MongoDB delete failed: {e}")
 
         # Then soft delete in MySQL
         sql_deleted = False
-        if existing_project is not None and existing_project.is_deleted is not True:
-            existing_project.is_deleted = True
-            db.commit()
-            sql_deleted = True
+        try:
+            if existing_project is not None and existing_project.is_deleted is not True:
+                existing_project.is_deleted = True
+                db.commit()
+                sql_deleted = True
+        except Exception as e:
+            db.rollback()
+            logger.error(f"MySQL delete failed: {e}")
 
         if not (mongo_deleted or sql_deleted):
             raise HTTPException(
