@@ -56,21 +56,31 @@ async def upload_file(
     if not category:
         raise HTTPException(status_code=400, detail="Category cannot be empty")
 
-    from app.utils.gcs import upload_content_to_gcs
+    import os
+    import shutil
+    import uuid
+    from pathlib import Path
+
+    # Create category directory
+    category_dir = os.path.join(BASE_UPLOAD_DIR, category)
+    os.makedirs(category_dir, exist_ok=True)
+
+    # Generate a unique filename to prevent overwrites
+    unique_filename = f"{uuid.uuid4().hex}_{file.filename}"
+    file_path_local = os.path.join(category_dir, unique_filename)
+
     try:
-        content = await file.read()
-        file_url = upload_content_to_gcs(
-            content=content, 
-            original_filename=file.filename,
-            content_type=file.content_type,
-            category=category
-        )
-        if not file_url:
-            raise HTTPException(status_code=500, detail="Failed to upload file to GCS")
-    except HTTPException:
-        raise
+        # Save file locally
+        with open(file_path_local, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # The URL that the frontend will use to access the file
+        # We use request.base_url to generate a full absolute URL so the frontend 
+        # doesn't incorrectly double-append the path.
+        file_url = f"{request.base_url}{file_path_local}"
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to save file locally: {str(e)}")
 
     # Prepare MongoDB record
     file_data = {

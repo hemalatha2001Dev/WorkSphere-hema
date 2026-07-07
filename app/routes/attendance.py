@@ -12,6 +12,38 @@ from app.core.config import settings
 router = APIRouter(prefix="/api/v1/attendance", tags=["Attendance"])
 
 
+# ==================== MANUAL SYNC ====================
+
+@router.post("/sync-now")
+def trigger_sync_now():
+    """
+    Manually trigger biometric device sync RIGHT NOW (today's swipes only).
+    This is fast — only pulls today's records from all 4 ZK devices.
+    After calling this, the day-details API will show the new swipes.
+    """
+    try:
+        from app.utils.zk_sync import sync_attendance_from_devices
+        sync_attendance_from_devices()
+        return {"status": "success", "message": "Today's biometric sync completed. All latest swipes are now in the database."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sync failed: {str(e)}")
+
+
+@router.post("/sync-all")
+def trigger_sync_all():
+    """
+    Full historical sync — pulls ALL records from ALL devices (past months + today).
+    WARNING: This takes several minutes as it processes 30K+ records per device.
+    Use this once to backfill historical data. After that, /sync-now is sufficient.
+    """
+    try:
+        from app.utils.zk_sync import sync_all_historical_data
+        sync_all_historical_data()
+        return {"status": "success", "message": "Full historical sync completed. All past and present swipes are now in the database."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Full sync failed: {str(e)}")
+
+
 # ==================== HELPER ====================
 
 def get_mongo_attendance(mongo_db, query: dict, sort_field="punch_time", limit=None):
@@ -443,3 +475,389 @@ def filter_attendance(
             cursor = cursor.skip(offset)
         records = list(cursor.limit(limit))
         return {"source": source, "data": records, "total": total, "page": page, "limit": limit}
+
+
+
+
+
+
+
+DEVICE_MAP = {
+    "192.168.0.75": "2nd Floor OUT",
+    "192.168.0.161": "2nd Floor IN",
+    "192.168.0.9": "4THFLOOR IN",
+    "192.168.0.87": "4THFLOOR OUT",
+}
+
+def get_val(record, key):
+    val = getattr(record, key, None) if not isinstance(record, dict) else record.get(key)
+    if key == "device_name" and not val:
+        ip = getattr(record, "device_ip", None) if not isinstance(record, dict) else record.get("device_ip")
+        if ip:
+            val = DEVICE_MAP.get(ip)
+    return val
+
+
+def parse_punch_time(ptime):
+    if isinstance(ptime, str):
+        try:
+            return datetime.fromisoformat(ptime)
+        except Exception:
+            return None
+    return ptime
+
+
+def get_first_last_swipe(records):
+    times = []
+
+    for r in records:
+        ptime = parse_punch_time(get_val(r, "punch_time"))
+
+        if ptime:
+            times.append(ptime)
+
+    if not times:
+        return None, None
+
+    times.sort()
+
+    return times[0], times[-1]
+
+# ==================== DASHBOARD & OVERVIEW ====================
+
+@router.get("/overview")
+def get_attendance_overview(
+    employee_id: int,
+    month: Optional[str] = Query(
+        None,
+        description="Month in YYYY-MM format. Defaults to current month."
+    ),
+    db: Session = Depends(get_db)
+):
+    """
+     Attendance Dashboard & Overview:
+    - Month-wise / Day-wise swipes detail
+    - First swipe and last swipe of each day
+    - Average working hours of the month
+    - Attendance metrics: Present days, Absent days, Late In count, Early Out count
+    - All session swipes for each day
+    """
+
+    if month:
+        try:
+            month_start = datetime.strptime(month, "%Y-%m")
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid month format. Use YYYY-MM."
+            )
+    else:
+        today = date.today()
+        month_start = datetime(today.year, today.month, 1)
+
+    # Calculate month range
+    if month_start.month == 12:
+        month_end = datetime(month_start.year + 1, 1, 1) - timedelta(seconds=1)
+    else:
+        month_end = datetime(month_start.year, month_start.month + 1, 1) - timedelta(seconds=1)
+
+    source = "mysql"
+    records = []
+
+    try:
+        records = (
+            db.query(AttendanceLog)
+            .filter(
+                AttendanceLog.user_id == employee_id,
+                AttendanceLog.punch_time >= month_start,
+                AttendanceLog.punch_time <= month_end
+            )
+            .order_by(AttendanceLog.punch_time.asc())
+            .all()
+        )
+    except Exception:
+        source = "mongodb (fallback)"
+        mongo_client = get_mongo_client()
+        mongo_db = mongo_client[settings.MONGO_DB_NAME] if mongo_client else None
+        records = get_mongo_attendance(
+            mongo_db,
+            {
+                "user_id": str(employee_id),
+                "punch_time": {
+                    "$gte": month_start,
+                    "$lte": month_end
+                }
+            }
+        )
+
+    # Group records by day
+    daily_records = defaultdict(list)
+    for r in records:
+        ptime = parse_punch_time(get_val(r, "punch_time"))
+        if ptime:
+            daily_records[ptime.strftime("%Y-%m-%d")].append(r)
+
+    # Define standard times
+    # Late In threshold: 09:30 AM
+    late_threshold = timedelta(hours=9, minutes=30)
+    # Early Out threshold: 06:00 PM (18:00)
+    early_threshold = timedelta(hours=18, minutes=0)
+
+    attendance_rows = []
+    total_hours = 0.0
+    late_in_count = 0
+    early_out_count = 0
+    present_days = 0
+
+    # Calculate metrics for days in the month
+    # We iterate from the start of the month to either the end of the month or today (whichever is earlier)
+    # to accurately count present/absent days without penalizing future days of the current month.
+    today_dt = datetime.now()
+    limit_date = min(month_end, today_dt)
+    
+    # We want to iterate through every calendar date from month_start to limit_date
+    current_day = month_start
+    all_month_days = []
+    while current_day <= limit_date:
+        all_month_days.append(current_day.date())
+        current_day += timedelta(days=1)
+
+    for day_date in all_month_days:
+        day_str = day_date.strftime("%Y-%m-%d")
+        day_name = day_date.strftime("%A")
+        recs = daily_records.get(day_str, [])
+
+        if recs:
+            present_days += 1
+            first_swipe, last_swipe = get_first_last_swipe(recs)
+            hours = compute_daily_hours(recs)
+            total_hours += hours
+
+            is_late_in = False
+            if first_swipe:
+                first_time_td = timedelta(hours=first_swipe.hour, minutes=first_swipe.minute, seconds=first_swipe.second)
+                if first_time_td > late_threshold:
+                    is_late_in = True
+                    late_in_count += 1
+
+            is_early_out = False
+            if last_swipe:
+                last_time_td = timedelta(hours=last_swipe.hour, minutes=last_swipe.minute, seconds=last_swipe.second)
+                if last_time_td < early_threshold:
+                    is_early_out = True
+                    early_out_count += 1
+
+            # Format all swipes for the day with details
+            swipes_detail = []
+            sorted_recs = sorted(recs, key=lambda x: parse_punch_time(get_val(x, "punch_time")) or datetime.min)
+            for r in sorted_recs:
+                ptime = parse_punch_time(get_val(r, "punch_time"))
+                if ptime:
+                    swipes_detail.append({
+                        "punch_time": ptime.strftime("%Y-%m-%d %H:%M:%S"),
+                        "time": ptime.strftime("%H:%M:%S"),
+                        "punch_type": get_val(r, "punch_type"),
+                        "device_ip": get_val(r, "device_ip"),
+                        "device_name": get_val(r, "device_name")
+                    })
+
+            attendance_rows.append({
+                "date": day_str,
+                "day_name": day_name,
+                "first_swipe": first_swipe.strftime("%H:%M:%S") if first_swipe else None,
+                "last_swipe": last_swipe.strftime("%H:%M:%S") if last_swipe else None,
+                "swipe_count": len(recs),
+                "working_hours": hours,
+                "status": "Present",
+                "is_late_in": is_late_in,
+                "is_early_out": is_early_out,
+                "swipes": swipes_detail
+            })
+        else:
+            # Check if it's a weekday
+            # 0=Monday, 4=Friday, 5=Saturday, 6=Sunday
+            is_weekday = day_date.weekday() < 5
+            status = "Absent" if is_weekday else "Weekend"
+
+            attendance_rows.append({
+                "date": day_str,
+                "day_name": day_name,
+                "first_swipe": None,
+                "last_swipe": None,
+                "swipe_count": 0,
+                "working_hours": 0.0,
+                "status": status,
+                "is_late_in": False,
+                "is_early_out": False,
+                "swipes": []
+            })
+
+    # Count absent days (Absent status weekdays only)
+    absent_days = sum(1 for row in attendance_rows if row["status"] == "Absent")
+    avg_working_hours = round(total_hours / present_days, 2) if present_days > 0 else 0.0
+
+    return {
+        "source": source,
+        "employee_id": employee_id,
+        "month": month_start.strftime("%Y-%m"),
+        "statistics": {
+            "present_days": present_days,
+            "absent_days": absent_days,
+            "total_working_hours": round(total_hours, 2),
+            "average_working_hours": avg_working_hours,
+            "late_in_count": late_in_count,
+            "early_out_count": early_out_count
+        },
+        "attendance": attendance_rows
+    }
+
+
+@router.get("/day-details")
+def get_day_details(
+    date_str: str = Query(..., alias="date", description="Date in YYYY-MM-DD format"),
+    employee_id: Optional[int] = Query(None, description="Employee ID. Leave empty to get all employees."),
+    shift_start: Optional[str] = Query("09:30", description="Shift start time in HH:MM format (default 09:30)"),
+    shift_end: Optional[str] = Query("18:00", description="Shift end time in HH:MM format (default 18:00)"),
+    db: Session = Depends(get_db)
+):
+    """
+    Day Details API — All swipes for ALL employees (or one employee) on a given date.
+    - Shift Timing is dynamic (pass shift_start & shift_end)
+    - Returns every single swipe recorded for the full 24-hour day
+    - Session Details pair consecutive swipes
+    - If employee_id is omitted, returns data for ALL employees
+    """
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    # Parse dynamic shift times
+    try:
+        shift_start_parts = [int(x) for x in shift_start.split(":")]
+        shift_end_parts = [int(x) for x in shift_end.split(":")]
+        late_threshold = timedelta(hours=shift_start_parts[0], minutes=shift_start_parts[1])
+        early_threshold = timedelta(hours=shift_end_parts[0], minutes=shift_end_parts[1])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid shift time format. Use HH:MM.")
+
+    shift_timing_str = f"{shift_start}-{shift_end}"
+
+    day_start = datetime.combine(target_date, datetime.min.time())
+    day_end   = datetime.combine(target_date, datetime.max.time())
+
+    source = "mysql"
+
+    try:
+        query = db.query(AttendanceLog).filter(
+            AttendanceLog.punch_time >= day_start,
+            AttendanceLog.punch_time <= day_end
+        )
+        if employee_id is not None:
+            query = query.filter(AttendanceLog.user_id == employee_id)
+
+        all_records = query.order_by(AttendanceLog.user_id, AttendanceLog.punch_time.asc()).all()
+    except Exception:
+        source = "mongodb (fallback)"
+        mongo_client = get_mongo_client()
+        mongo_db = mongo_client[settings.MONGO_DB_NAME] if mongo_client else None
+        mongo_query = {"punch_time": {"$gte": day_start, "$lte": day_end}}
+        if employee_id is not None:
+            mongo_query["user_id"] = str(employee_id)
+        all_records = get_mongo_attendance(mongo_db, mongo_query, sort_field="punch_time")
+
+    # Group records by employee
+    employee_records = defaultdict(list)
+    for r in all_records:
+        uid = get_val(r, "user_id")
+        employee_records[uid].append(r)
+
+    # Build response for each employee
+    employees_data = []
+
+    for uid, records in sorted(employee_records.items(), key=lambda x: x[0]):
+        sorted_recs = sorted(records, key=lambda x: parse_punch_time(get_val(x, "punch_time")) or datetime.min)
+        first_swipe, last_swipe = get_first_last_swipe(sorted_recs)
+        hours = compute_daily_hours(sorted_recs)
+
+        # Pair every single swipe sequentially (1st-2nd, 3rd-4th, etc.)
+        sessions = []
+        sorted_times = [parse_punch_time(get_val(x, "punch_time")) for x in sorted_recs if parse_punch_time(get_val(x, "punch_time"))]
+        session_num = 1
+        for idx in range(0, len(sorted_times), 2):
+            check_in_time = sorted_times[idx]
+            if idx + 1 < len(sorted_times):
+                check_out_time = sorted_times[idx + 1]
+                dur_seconds = (check_out_time - check_in_time).total_seconds()
+                sessions.append({
+                    "session": f"Session {session_num}",
+                    "check_in": check_in_time.strftime("%H:%M:%S"),
+                    "check_out": check_out_time.strftime("%H:%M:%S"),
+                    "duration_hours": round(dur_seconds / 3600, 2)
+                })
+            else:
+                sessions.append({
+                    "session": f"Session {session_num}",
+                    "check_in": check_in_time.strftime("%H:%M:%S"),
+                    "check_out": None,
+                    "duration_hours": 0.0
+                })
+            session_num += 1
+
+        # Build ALL raw swipes list
+        swipes_list = []
+        for idx, r in enumerate(sorted_recs):
+            ptime = parse_punch_time(get_val(r, "punch_time"))
+            if ptime:
+                device_name = get_val(r, "device_name")
+                direction = "IN" if "IN" in str(device_name or "").upper() else ("OUT" if "OUT" in str(device_name or "").upper() else "IN")
+                swipes_list.append({
+                    "swipe_number": idx + 1,
+                    "time": ptime.strftime("%H:%M:%S"),
+                    "punch_time": ptime.strftime("%Y-%m-%d %H:%M:%S"),
+                    "direction": direction,
+                    "device_name": device_name,
+                    "device_ip": get_val(r, "device_ip")
+                })
+
+        is_weekday = target_date.weekday() < 5
+        status = "Present" if sorted_recs else ("Absent" if is_weekday else "Weekend")
+
+        is_late_in = False
+        if first_swipe:
+            first_time_td = timedelta(hours=first_swipe.hour, minutes=first_swipe.minute, seconds=first_swipe.second)
+            if first_time_td > late_threshold:
+                is_late_in = True
+
+        is_early_out = False
+        if last_swipe:
+            last_time_td = timedelta(hours=last_swipe.hour, minutes=last_swipe.minute, seconds=last_swipe.second)
+            if last_time_td < early_threshold:
+                is_early_out = True
+
+        employees_data.append({
+            "employee_id": uid,
+            "status": status,
+            "first_swipe": first_swipe.strftime("%H:%M:%S") if first_swipe else None,
+            "last_swipe": last_swipe.strftime("%H:%M:%S") if last_swipe else None,
+            "working_hours": hours,
+            "total_swipes": len(swipes_list),
+            "is_late_in": is_late_in,
+            "is_early_out": is_early_out,
+            "session_details": sessions,
+            "swipes": swipes_list
+        })
+
+    # Suffix for date presentation
+    suffix = "th" if 11 <= target_date.day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(target_date.day % 10, "th")
+    processed_date_str = target_date.strftime(f"%d{suffix} %b")
+
+    return {
+        "source": source,
+        "date": date_str,
+        "shift_timing": shift_timing_str,
+        "attendance_scheme": "Hyderabad Scheme (Geo-Fencing)",
+        "processed_on": f"Processed on {processed_date_str}",
+        "total_employees": len(employees_data),
+        "employees": employees_data
+    }
